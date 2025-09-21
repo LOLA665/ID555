@@ -1,0 +1,123 @@
+name: Windows 2025 Virtual PC with Simulated RTX 5080 GPU and 32GB RAM
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-virtual-pc:
+    runs-on: windows-2025
+    timeout-minutes: 3600
+
+    steps:
+      - name: Create and mount 699GB Virtual SSD
+        run: |
+          $VhdPath = "C:\virtualSSD.vhdx"
+          $SizeBytes = 699GB
+          if (-not (Test-Path $VhdPath)) {
+              New-VHD -Path $VhdPath -SizeBytes $SizeBytes -Dynamic
+              Mount-VHD -Path $VhdPath
+              $disk = Get-Disk | Where-Object PartitionStyle -Eq "RAW"
+              Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru | `
+                New-Partition -UseMaximumSize -AssignDriveLetter | `
+                Format-Volume -FileSystem NTFS -NewFileSystemLabel "VirtualSSD" -Confirm:$false
+              Write-Host "Virtual SSD de 699GB creat și montat"
+          } else {
+              Mount-VHD -Path $VhdPath
+              Write-Host "Virtual SSD deja existent montat"
+          }
+
+      - name: Simulate GPU as NVIDIA RTX 5080 Emulator in Registry
+        run: |
+          $regPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\DISPLAY"
+          $deviceKeys = Get-ChildItem -Path $regPath
+          foreach ($key in $deviceKeys) {
+              $subKeys = Get-ChildItem -Path $key.PSPath -ErrorAction SilentlyContinue
+              foreach ($subKey in $subKeys) {
+                  try {
+                      $deviceDesc = Get-ItemProperty -Path $subKey.PSPath -Name "DeviceDesc" -ErrorAction Stop
+                      if ($deviceDesc.DeviceDesc -match "Microsoft Basic Display Adapter") {
+                          $reg = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKey.PSPath.Replace('HKLM:\',''), $true)
+                          if ($reg -ne $null) {
+                              $reg.SetValue("DeviceDesc", "NVIDIA RTX 5080 Emulator", [Microsoft.Win32.RegistryValueKind]::String)
+                              Write-Host "GPU denumirea schimbată în NVIDIA RTX 5080 Emulator"
+                              $reg.Close()
+                          }
+                      }
+                  } catch {}
+              }
+          }
+
+      - name: Set environment variables for RAM emulation
+        run: |
+          echo "EMULATED_RAM=32GB" >> $env:GITHUB_ENV
+          echo "REAL_RAM=16GB" >> $env:GITHUB_ENV
+          Write-Host "Variabilele de mediu RAM setate: 32GB emulat, 16GB real"
+
+      - name: Configure RDP and Firewall Rules
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>nul || echo "Regula nu a fost găsită, sărim ștergerea."
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 profile=any
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create Admin User for RDP
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+            Upper=[char[]](65..90)
+            Lower=[char[]](97..122)
+            Number=[char[]](48..57)
+            Special=([char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          }
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install and Connect Tailscale VPN
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Connection and Maintain Session
+        run: |
+          $conn = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $conn.TcpTestSucceeded) {
+            Write-Error "Portul RDP 3389 nu este accesibil"
+            exit 1
+          }
+          Write-Host "Portul RDP 3389 este accesibil"
+          Write-Host "=== INFORMAȚII ACCES RDP ==="
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host $(echo $env:RDP_CREDS)
+          Write-Host "RAM emulat: $env:EMULATED_RAM"
+          Write-Host "RAM real: $env:REAL_RAM"
+          Write-Host "SSD virtual: 699GB"
+          Write-Host "GPU simulat: NVIDIA RTX 5080 Emulator"
+          Write-Host "==========================="
+          while ($true) {
+            Write-Host "[$(Get-Date)] Sesiune RDP activă. Termină manual workflow-ul pentru a opri."
+            Start-Sleep -Seconds 300
+          }
+          
