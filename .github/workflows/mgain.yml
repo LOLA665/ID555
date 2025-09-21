@@ -1,0 +1,42 @@
+name: Windows RDP Tunnel via Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-tunnel:
+    runs-on: windows-latest
+    timeout-minutes: 360   # maxim 6 ore
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Tailscale
+        run: |
+          Invoke-WebRequest -Uri https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile tailscale.msi
+          msiexec /i tailscale.msi /qn
+
+      - name: Connect Tailscale
+        run: |
+          "C:\Program Files\Tailscale\tailscale.exe" up --authkey ${{ secrets.TS_AUTHKEY }} --accept-routes --accept-dns
+
+      - name: Configure RDP + User
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\setup-rdp-tailscale.ps1
+
+      - name: Show Tailscale IP
+        run: |
+          "C:\Program Files\Tailscale\tailscale.exe" ip -4
+
+      - name: Upload RDP Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-logs
+          path: C:\RDP_logs\rdp_log.txt
+
+      - name: Keep alive for 6h
+        run: |
+          echo "Runner will stay alive for 6 hours."
+          powershell -command "Start-Sleep -Seconds 21600"
+          
